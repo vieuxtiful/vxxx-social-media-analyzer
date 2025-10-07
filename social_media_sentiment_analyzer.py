@@ -1,8 +1,10 @@
 """
 SocialMediaSentimentAnalyzer - Advanced Opinion Mining Tool
+>>Word2World Social<<
 
 This tool leverages sophisticated mathematical frameworks to provide advanced sentiment analysis with uncertainty
 quantification and explainable AI capabilities.
+>>bridging ideas together<<
 
 Key Features:
 - Bayesian-SVM hybrid classification with confidence scores
@@ -16,928 +18,619 @@ License: MIT
 """
 
 import numpy as np
-import pandas as pd
-import logging
-from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
-from collections import defaultdict, OrderedDict
-import re
-import json
-import time
-from datetime import datetime
-import warnings
+from typing import List, Dict, Tuple, Optional
+import heapq
+import pickle
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
-# Core mathematical components adapted from LexiQ
-from sklearn.svm import SVC
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
-import scipy.stats as stats
-from scipy.special import logsumexp
-
-# Deep learning components
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential, Model
-    from tensorflow.keras.layers import Dense, LSTM, Conv1D, GlobalMaxPooling1D, Embedding, Dropout, Bidirectional
-    from tensorflow.keras.preprocessing.text import Tokenizer
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-    TENSORFLOW_AVAILABLE = True
-except ImportError:
-    TENSORFLOW_AVAILABLE = False
-    warnings.warn("TensorFlow not available. Deep learning features will be disabled.")
-
-# Explainable AI components
-try:
-    import lime
-    from lime.lime_text import LimeTextExplainer
-    import shap
-    EXPLAINABLE_AI_AVAILABLE = True
-except ImportError:
-    EXPLAINABLE_AI_AVAILABLE = False
-    warnings.warn("LIME/SHAP not available. Explainable AI features will be disabled.")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-@dataclass
-class SentimentResult:
-    """Data class for sentiment analysis results."""
-    text: str
-    sentiment: str  # 'positive', 'negative', 'neutral'
-    confidence: float
-    uncertainty: float
-    explanation: Optional[Dict] = None
-    key_phrases: Optional[List[str]] = None
-    processing_time: Optional[float] = None
-    language: Optional[str] = None
-
-@dataclass
-class AnalysisConfig:
-    """Configuration for sentiment analysis."""
-    max_features: int = 10000
-    max_sequence_length: int = 100
-    embedding_dim: int = 128
-    lstm_units: int = 64
-    cnn_filters: int = 128
-    kernel_sizes: List[int] = None
-    dropout_rate: float = 0.5
-    regularization_strength: float = 1.0
-    cache_size: int = 1000
-    uncertainty_threshold: float = 0.3
-
-    def __post_init__(self):
-        if self.kernel_sizes is None:
-            self.kernel_sizes = [3, 4, 5]
-
-class NumericalStabilityUtils:
+class ScalableSemanticIndex:
     """
-    Numerical stability utilities.
-    Ensures stable computation for large-scale sentiment analysis.
+    Advanced semantic indexing system that combines multiple ANN strategies
+    for different scale and accuracy requirements.
     """
-
-    @staticmethod
-    def safe_log(x: np.ndarray, epsilon: float = 1e-15) -> np.ndarray:
-        """Compute log with numerical stability."""
-        return np.log(np.maximum(x, epsilon))
-
-    @staticmethod
-    def log_sum_exp(x: np.ndarray, axis: int = None) -> np.ndarray:
-        """Numerically stable log-sum-exp computation."""
-        return logsumexp(x, axis=axis)
-
-    @staticmethod
-    def normalize_log_probabilities(log_probs: np.ndarray) -> np.ndarray:
-        """Normalize log probabilities to sum to 1."""
-        log_sum = NumericalStabilityUtils.log_sum_exp(log_probs)
-        return np.exp(log_probs - log_sum)
-
-class BayesianSVMOptimizer:
-    """
-    Bayesian-SVM hybrid optimizer.
-    Combines discriminative power of SVM with uncertainty quantification of Bayesian inference.
-    """
-
-    def __init__(self, regularization_strength: float = 1.0, alpha: float = 0.7):
-        """
-        Initialize Bayesian-SVM hybrid optimizer.
-
-        Args:
-            regularization_strength: SVM regularization parameter
-            alpha: Weighting between SVM (alpha) and Bayesian (1-alpha) components
-        """
-        self.regularization_strength = regularization_strength
-        self.alpha = alpha
-        self.svm_model = None
-        self.bayesian_priors = {}
-        self.class_statistics = {}
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'BayesianSVMOptimizer':
-        """
-        Train the hybrid Bayesian-SVM model.
-
-        Args:
-            X: Feature matrix
-            y: Target labels
-
-        Returns:
-            Self for method chaining
-        """
-        logger.info("Training Bayesian-SVM hybrid model...")
-
-        # Train SVM component
-        self.svm_model = SVC(
-            probability=True,
-            C=self.regularization_strength,
-            kernel='rbf',
-            random_state=42
-        )
-        self.svm_model.fit(X, y)
-
-        # Compute Bayesian statistics
-        self._compute_bayesian_statistics(X, y)
-
-        logger.info("Bayesian-SVM training completed.")
-        return self
-
-    def _compute_bayesian_statistics(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Compute Bayesian prior and likelihood statistics."""
-        unique_classes = np.unique(y)
-        n_samples = len(y)
-
-        for class_label in unique_classes:
-            class_mask = (y == class_label)
-            class_samples = X[class_mask]
-
-            # Compute class prior with Laplace smoothing
-            class_count = np.sum(class_mask)
-            prior = (class_count + 1) / (n_samples + len(unique_classes))
-
-            # Compute class statistics for likelihood
-            mean = np.mean(class_samples, axis=0)
-            cov = np.cov(class_samples.T) + np.eye(X.shape[1]) * 1e-6  # Regularization
-
-            self.bayesian_priors[class_label] = NumericalStabilityUtils.safe_log(np.array([prior]))
-            self.class_statistics[class_label] = {
-                'mean': mean,
-                'cov': cov,
-                'inv_cov': np.linalg.inv(cov)
-            }
-
-    def _compute_bayesian_posterior(self, X: np.ndarray) -> np.ndarray:
-        """Compute Bayesian posterior probabilities in log-space."""
-        n_samples = X.shape[0]
-        n_classes = len(self.class_statistics)
-        log_posteriors = np.zeros((n_samples, n_classes))
-
-        for i, (class_label, stats) in enumerate(self.class_statistics.items()):
-            # Compute log-likelihood using multivariate Gaussian
-            diff = X - stats['mean']
-            mahalanobis = np.sum(diff @ stats['inv_cov'] * diff, axis=1)
-            log_likelihood = -0.5 * mahalanobis
-
-            # Add log prior
-            log_posterior = log_likelihood + self.bayesian_priors[class_label]
-            log_posteriors[:, i] = log_posterior
-
-        # Normalize to get probabilities
-        normalized_posteriors = np.array([
-            NumericalStabilityUtils.normalize_log_probabilities(log_post)
-            for log_post in log_posteriors
-        ])
-
-        return normalized_posteriors
-
-    def predict_hybrid(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Predict using hybrid Bayesian-SVM approach with uncertainty quantification.
-
-        Args:
-            X: Feature matrix
-
-        Returns:
-            Tuple of (predictions, uncertainties)
-        """
-        # Get SVM predictions
-        svm_probs = self.svm_model.predict_proba(X)
-
-        # Get Bayesian predictions
-        bayesian_probs = self._compute_bayesian_posterior(X)
-
-        # Combine predictions
-        combined_probs = (self.alpha * svm_probs +
-                         (1 - self.alpha) * bayesian_probs)
-
-        # Get predictions and uncertainties
-        predictions = np.argmax(combined_probs, axis=1)
-        uncertainties = 1 - np.max(combined_probs, axis=1)  # Uncertainty as 1 - max_prob
-
-        return predictions, uncertainties
-
-class DeepLearningSentimentAnalyzer:
-    """
-    Deep learning component.
-    Provides sequential pattern analysis for social media text.
-    """
-
-    def __init__(self, config: AnalysisConfig):
-        """Initialize deep learning analyzer."""
-        self.config = config
-        self.tokenizer = None
-        self.cnn_model = None
-        self.lstm_model = None
-        self.ensemble_model = None
-
-        if not TENSORFLOW_AVAILABLE:
-            logger.warning("TensorFlow not available. Deep learning features disabled.")
-
-    def build_cnn_model(self, vocab_size: int, num_classes: int) -> Optional[Model]:
-        """Build CNN model for local pattern detection."""
-        if not TENSORFLOW_AVAILABLE:
-            return None
-
-        # Input layer
-        input_layer = tf.keras.Input(shape=(self.config.max_sequence_length,))
-
-        # Embedding layer
-        embedding = Embedding(
-            vocab_size,
-            self.config.embedding_dim,
-            input_length=self.config.max_sequence_length
-        )(input_layer)
-
-        # Multiple CNN branches with different kernel sizes
-        conv_outputs = []
-        for kernel_size in self.config.kernel_sizes:
-            conv = Conv1D(
-                self.config.cnn_filters,
-                kernel_size,
-                activation='relu'
-            )(embedding)
-            pooled = GlobalMaxPooling1D()(conv)
-            conv_outputs.append(pooled)
-
-        # Concatenate CNN outputs
-        if len(conv_outputs) > 1:
-            combined = tf.keras.layers.Concatenate()(conv_outputs)
-        else:
-            combined = conv_outputs[0]
-
-        # Dense layers
-        dense = Dense(64, activation='relu')(combined)
-        dropout = Dropout(self.config.dropout_rate)(dense)
-        output = Dense(num_classes, activation='softmax')(dropout)
-
-        model = Model(input_layer, output)
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-
-        return model
-
-    def build_lstm_model(self, vocab_size: int, num_classes: int) -> Optional[Model]:
-        """Build LSTM model for sequential pattern analysis."""
-        if not TENSORFLOW_AVAILABLE:
-            return None
-
-        model = Sequential([
-            Embedding(
-                vocab_size,
-                self.config.embedding_dim,
-                input_length=self.config.max_sequence_length
-            ),
-            Bidirectional(LSTM(
-                self.config.lstm_units,
-                return_sequences=True,
-                dropout=self.config.dropout_rate
-            )),
-            Bidirectional(LSTM(
-                self.config.lstm_units // 2,
-                dropout=self.config.dropout_rate
-            )),
-            Dense(32, activation='relu'),
-            Dropout(self.config.dropout_rate),
-            Dense(num_classes, activation='softmax')
-        ])
-
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-
-        return model
-
-    def prepare_data(self, texts: List[str]) -> np.ndarray:
-        """Prepare text data for deep learning models."""
-        if self.tokenizer is None:
-            self.tokenizer = Tokenizer(num_words=self.config.max_features)
-            self.tokenizer.fit_on_texts(texts)
-
-        sequences = self.tokenizer.texts_to_sequences(texts)
-        return pad_sequences(sequences, maxlen=self.config.max_sequence_length)
-
-    def train_models(self, X_text: List[str], y: np.ndarray) -> None:
-        """Train CNN and LSTM models."""
-        if not TENSORFLOW_AVAILABLE:
-            logger.warning("Cannot train deep learning models without TensorFlow.")
-            return
-
-        # Prepare data
-        X_sequences = self.prepare_data(X_text)
-        vocab_size = min(self.config.max_features, len(self.tokenizer.word_index) + 1)
-        num_classes = len(np.unique(y))
-
-        # Split data
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_sequences, y, test_size=0.2, random_state=42
-        )
-
-        # Build and train CNN
-        logger.info("Training CNN model...")
-        self.cnn_model = self.build_cnn_model(vocab_size, num_classes)
-        if self.cnn_model:
-            self.cnn_model.fit(
-                X_train, y_train,
-                validation_data=(X_val, y_val),
-                epochs=10,
-                batch_size=32,
-                verbose=1
-            )
-
-        # Build and train LSTM
-        logger.info("Training LSTM model...")
-        self.lstm_model = self.build_lstm_model(vocab_size, num_classes)
-        if self.lstm_model:
-            self.lstm_model.fit(
-                X_train, y_train,
-                validation_data=(X_val, y_val),
-                epochs=10,
-                batch_size=32,
-                verbose=1
-            )
-
-    def predict_ensemble(self, texts: List[str]) -> np.ndarray:
-        """Predict using ensemble of CNN and LSTM models."""
-        if not TENSORFLOW_AVAILABLE or (self.cnn_model is None and self.lstm_model is None):
-            return np.array([])
-
-        X_sequences = self.prepare_data(texts)
-        predictions = []
-
-        if self.cnn_model is not None:
-            cnn_pred = self.cnn_model.predict(X_sequences)
-            predictions.append(cnn_pred)
-
-        if self.lstm_model is not None:
-            lstm_pred = self.lstm_model.predict(X_sequences)
-            predictions.append(lstm_pred)
-
-        if predictions:
-            # Average ensemble predictions
-            ensemble_pred = np.mean(predictions, axis=0)
-            return ensemble_pred
-
-        return np.array([])
-
-class ExplainableAIIntegrator:
-    """
-    Explainable AI component.
-    Provides transparent explanations for sentiment predictions.
-    """
-
-    def __init__(self):
-        """Initialize explainable AI integrator."""
-        self.lime_explainer = None
-        self.shap_explainer = None
-
-        if EXPLAINABLE_AI_AVAILABLE:
-            self.lime_explainer = LimeTextExplainer(class_names=['negative', 'neutral', 'positive'])
-        else:
-            logger.warning("LIME/SHAP not available. Explanation features disabled.")
-
-    def explain_prediction_lime(self, text: str, predict_fn, num_features: int = 10) -> Dict:
-        """Generate LIME explanation for a prediction."""
-        if not EXPLAINABLE_AI_AVAILABLE or self.lime_explainer is None:
-            return {'explanation': 'Explanation not available', 'feature_importance': []}
-
+    
+    def __init__(self, 
+                 dimension: int = 128,
+                 initial_capacity: int = 100000,
+                 max_capacity: int = 10000000,
+                 ann_method: str = 'hnsw',  # 'hnsw', 'ivf', 'lsh', 'composite'
+                 precision_level: str = 'adaptive'):  # 'high', 'medium', 'adaptive'
+        
+        self.dimension = dimension
+        self.current_capacity = initial_capacity
+        self.max_capacity = max_capacity
+        self.ann_method = ann_method
+        self.precision_level = precision_level
+        
+        # Multiple indexing strategies
+        self.primary_index = None
+        self.secondary_index = None
+        self.fallback_index = None
+        
+        # Query optimization
+        self.query_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        # Performance monitoring
+        self.query_times = []
+        self.index_update_times = []
+        
+        self._initialize_indices()
+        
+    def _initialize_indices(self):
+        """Initialize appropriate ANN indices based on configuration."""
         try:
-            explanation = self.lime_explainer.explain_instance(
-                text, predict_fn, num_features=num_features
-            )
-
-            feature_importance = explanation.as_list()
-            explanation_text = self._generate_explanation_text(feature_importance)
-
-            return {
-                'explanation': explanation_text,
-                'feature_importance': feature_importance,
-                'confidence': explanation.score if hasattr(explanation, 'score') else 0.0
-            }
-        except Exception as e:
-            logger.error(f"Error generating LIME explanation: {e}")
-            return {'explanation': 'Error generating explanation', 'feature_importance': []}
-
-    def _generate_explanation_text(self, feature_importance: List[Tuple[str, float]]) -> str:
-        """Generate human-readable explanation from feature importance."""
-        if not feature_importance:
-            return "No significant features identified."
-
-        positive_features = [(word, score) for word, score in feature_importance if score > 0]
-        negative_features = [(word, score) for word, score in feature_importance if score < 0]
-
-        explanation_parts = []
-
-        if positive_features:
-            pos_words = [f"'{word}'" for word, _ in positive_features[:3]]
-            explanation_parts.append(f"Positive indicators: {', '.join(pos_words)}")
-
-        if negative_features:
-            neg_words = [f"'{word}'" for word, _ in negative_features[:3]]
-            explanation_parts.append(f"Negative indicators: {', '.join(neg_words)}")
-
-        return ". ".join(explanation_parts) + "."
-
-class AdvancedMultilingualParser:
-    """
-    Multilingual processing component.
-    Handles text preprocessing across different languages.
-    """
-
-    def __init__(self):
-        """Initialize multilingual parser."""
-        self.language_patterns = {
-            'en': re.compile(r'[a-zA-Z]+'),
-            'es': re.compile(r'[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ]+'),
-            'fr': re.compile(r'[a-zA-ZàâäéèêëïîôöùûüÿçÀÂÄÉÈÊËÏÎÔÖÙÛÜŸÇ]+'),
-            'de': re.compile(r'[a-zA-ZäöüßÄÖÜ]+'),
-            'it': re.compile(r'[a-zA-ZàèéìíîòóùúÀÈÉÌÍÎÒÓÙÚ]+')
-        }
-
-        # Social media specific patterns
-        self.emoji_pattern = re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+')
-        self.hashtag_pattern = re.compile(r'#\w+')
-        self.mention_pattern = re.compile(r'@\w+')
-        self.url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
-
-    def detect_language(self, text: str) -> str:
-        """Simple language detection based on character patterns."""
-        # Remove social media elements for language detection
-        clean_text = self._clean_social_media_text(text)
-
-        # Count matches for each language pattern
-        language_scores = {}
-        for lang, pattern in self.language_patterns.items():
-            matches = pattern.findall(clean_text.lower())
-            language_scores[lang] = len(matches)
-
-        # Return language with highest score, default to English
-        if language_scores:
-            return max(language_scores, key=language_scores.get)
-        return 'en'
-
-    def _clean_social_media_text(self, text: str) -> str:
-        """Clean social media specific elements."""
-        # Remove URLs
-        text = self.url_pattern.sub(' ', text)
-        # Remove mentions
-        text = self.mention_pattern.sub(' ', text)
-        # Remove hashtags (but keep the text)
-        text = self.hashtag_pattern.sub(lambda m: m.group()[1:], text)
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-
-    def extract_social_features(self, text: str) -> Dict:
-        """Extract social media specific features."""
-        return {
-            'emoji_count': len(self.emoji_pattern.findall(text)),
-            'hashtag_count': len(self.hashtag_pattern.findall(text)),
-            'mention_count': len(self.mention_pattern.findall(text)),
-            'url_count': len(self.url_pattern.findall(text)),
-            'exclamation_count': text.count('!'),
-            'question_count': text.count('?'),
-            'caps_ratio': sum(1 for c in text if c.isupper()) / max(len(text), 1),
-            'length': len(text),
-            'word_count': len(text.split())
-        }
-
-    def process_content(self, text: str) -> Dict:
-        """Process social media content with language detection and feature extraction."""
-        language = self.detect_language(text)
-        cleaned_text = self._clean_social_media_text(text)
-        social_features = self.extract_social_features(text)
-
-        return {
-            'original_text': text,
-            'cleaned_text': cleaned_text,
-            'detected_language': language,
-            'social_features': social_features
-        }
-
-class IntelligentCachingSystem:
-    """
-    Intelligent caching system.
-    Provides efficient caching for real-time social media analysis.
-    """
-
-    def __init__(self, max_size: int = 1000):
-        """Initialize intelligent caching system."""
-        self.max_size = max_size
-        self.cache = OrderedDict()
-        self.access_counts = defaultdict(int)
-        self.access_times = {}
-
-    def _compute_priority_score(self, key: str, result: SentimentResult) -> float:
-        """Compute priority score for cache entry."""
-        access_count = self.access_counts.get(key, 1)
-        current_time = time.time()
-        last_access = self.access_times.get(key, current_time)
-        recency_factor = 1.0 / (1.0 + (current_time - last_access) / 3600)  # Hour-based decay
-
-        # Combine factors: confidence, access frequency, recency
-        priority = (
-            0.4 * result.confidence +
-            0.3 * np.log(access_count + 1) +
-            0.3 * recency_factor
-        )
-        return priority
-
-    def get(self, key: str) -> Optional[SentimentResult]:
-        """Get cached result."""
-        if key in self.cache:
-            # Update access statistics
-            self.access_counts[key] += 1
-            self.access_times[key] = time.time()
-
-            # Move to end (most recently used)
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
-
-    def put(self, key: str, result: SentimentResult) -> None:
-        """Cache analysis result."""
-        current_time = time.time()
-
-        if key in self.cache:
-            # Update existing entry
-            self.cache[key] = result
-            self.cache.move_to_end(key)
-        else:
-            # Add new entry
-            if len(self.cache) >= self.max_size:
-                self._evict_lowest_priority()
-
-            self.cache[key] = result
-            self.access_times[key] = current_time
-            self.access_counts[key] = 1
-
-    def _evict_lowest_priority(self) -> None:
-        """Evict entry with lowest priority score."""
-        if not self.cache:
+            if self.ann_method in ['hnsw', 'composite']:
+                import hnswlib
+                self.primary_index = hnswlib.Index(space='cosine', dim=self.dimension)
+                self.primary_index.init_index(max_elements=self.current_capacity, 
+                                            ef_construction=200, M=16)
+                self.primary_index.set_ef(50)  # Query time accuracy/speed trade-off
+                
+            if self.ann_method in ['ivf', 'composite']:
+                try:
+                    import faiss
+                    self.secondary_index = faiss.IndexIVFFlat(
+                        faiss.IndexFlatIP(self.dimension), 
+                        self.dimension, 
+                        min(16384, self.current_capacity // 39)
+                    )
+                    # Train with random data initially
+                    training_data = np.random.random((1000, self.dimension)).astype('float32')
+                    self.secondary_index.train(training_data)
+                except ImportError:
+                    print("FAISS not available, falling back to HNSW only")
+                    
+            if self.ann_method == 'composite':
+                # Composite index uses both HNSW and IVF for different query patterns
+                self.query_router = QueryRouter()
+                
+        except ImportError as e:
+            print(f"ANN library import failed: {e}. Using fallback methods.")
+            self._setup_fallback_indices()
+    
+    def _setup_fallback_indices(self):
+        """Setup fallback indexing methods when optimized libraries aren't available."""
+        print("Using fallback BallTree indexing - consider installing hnswlib/faiss for better performance")
+        from sklearn.neighbors import BallTree
+        self.fallback_index = BallTree(metric='cosine')
+        self.fallback_data = None
+        
+    def add_items(self, vectors: np.ndarray, ids: List[str], incremental: bool = True):
+        """
+        Add vectors to the index with efficient batch processing.
+        
+        Args:
+            vectors: Array of shape (n_vectors, dimension)
+            ids: List of string identifiers
+            incremental: Whether to update indices incrementally
+        """
+        if len(vectors) == 0:
             return
-
-        # Compute priority scores for all entries
-        priorities = {}
-        for key, result in self.cache.items():
-            priorities[key] = self._compute_priority_score(key, result)
-
-        # Remove entry with lowest priority
-        lowest_priority_key = min(priorities, key=priorities.get)
-        del self.cache[lowest_priority_key]
-        del self.access_counts[lowest_priority_key]
-        del self.access_times[lowest_priority_key]
-
-class SocialMediaSentimentAnalyzer:
-    """
-    Main sentiment analyzer class that orchestrates all components.
-    """
-
-    def __init__(self, config: Optional[AnalysisConfig] = None):
-        """
-        Initialize Social Media Sentiment Analyzer.
-
-        Args:
-            config: Analysis configuration
-        """
-        self.config = config or AnalysisConfig()
-
-        # Initialize components adapted from LexiQ
-        self.bayesian_svm = BayesianSVMOptimizer(
-            regularization_strength=self.config.regularization_strength
-        )
-        self.deep_learning = DeepLearningSentimentAnalyzer(self.config)
-        self.explainer = ExplainableAIIntegrator()
-        self.multilingual_parser = AdvancedMultilingualParser()
-        self.cache_system = IntelligentCachingSystem(self.config.cache_size)
-
-        # Feature extraction components
-        self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=self.config.max_features,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        self.scaler = StandardScaler()
-
-        # Model state
-        self.is_trained = False
-        self.label_encoder = {'negative': 0, 'neutral': 1, 'positive': 2}
-        self.label_decoder = {v: k for k, v in self.label_encoder.items()}
-
-        logger.info("SocialMediaSentimentAnalyzer initialized successfully.")
-
-    def _extract_features(self, processed_content: Dict) -> np.ndarray:
-        """Extract comprehensive features for sentiment analysis."""
-        text = processed_content['cleaned_text']
-        social_features = processed_content['social_features']
-
-        # Text features (TF-IDF)
-        if hasattr(self.tfidf_vectorizer, 'vocabulary_'):
-            text_features = self.tfidf_vectorizer.transform([text]).toarray()[0]
-        else:
-            # If not fitted, return zeros
-            text_features = np.zeros(self.config.max_features)
-
-        # Social media features
-        social_feature_vector = np.array([
-            social_features['emoji_count'],
-            social_features['hashtag_count'],
-            social_features['mention_count'],
-            social_features['url_count'],
-            social_features['exclamation_count'],
-            social_features['question_count'],
-            social_features['caps_ratio'],
-            np.log(social_features['length'] + 1),
-            np.log(social_features['word_count'] + 1)
-        ])
-
-        # Combine features
-        combined_features = np.concatenate([text_features, social_feature_vector])
-        return combined_features
-
-    def train(self, texts: List[str], labels: List[str]) -> 'SocialMediaSentimentAnalyzer':
-        """
-        Train the sentiment analyzer.
-
-        Args:
-            texts: List of social media texts
-            labels: List of sentiment labels ('positive', 'negative', 'neutral')
-
-        Returns:
-            Self for method chaining
-        """
-        logger.info(f"Training sentiment analyzer on {len(texts)} samples...")
-
-        # Process texts
-        processed_contents = [self.multilingual_parser.process_content(text) for text in texts]
-
-        # Extract text features
-        cleaned_texts = [content['cleaned_text'] for content in processed_contents]
-        self.tfidf_vectorizer.fit(cleaned_texts)
-
-        # Extract all features
-        features = np.array([self._extract_features(content) for content in processed_contents])
-
-        # Scale features
-        features_scaled = self.scaler.fit_transform(features)
-
-        # Encode labels
-        y_encoded = np.array([self.label_encoder[label] for label in labels])
-
-        # Train Bayesian-SVM hybrid
-        self.bayesian_svm.fit(features_scaled, y_encoded)
-
-        # Train deep learning models
-        self.deep_learning.train_models(cleaned_texts, y_encoded)
-
-        self.is_trained = True
-        logger.info("Training completed successfully.")
-        return self
-
-    def analyze_sentiment(self, text: str, explain: bool = True) -> SentimentResult:
-        """
-        Analyze sentiment of a single text.
-
-        Args:
-            text: Social media text to analyze
-            explain: Whether to generate explanations
-
-        Returns:
-            SentimentResult with analysis details
-        """
+            
         start_time = time.time()
-
-        # Check cache first
-        cache_key = hash(text)
-        cached_result = self.cache_system.get(str(cache_key))
-        if cached_result is not None:
-            logger.debug("Returning cached result.")
-            return cached_result
-
-        if not self.is_trained:
-            raise ValueError("Model must be trained before analysis. Call train() first.")
-
-        # Process content
-        processed_content = self.multilingual_parser.process_content(text)
-
-        # Extract features
-        features = self._extract_features(processed_content).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-
-        # Get predictions from Bayesian-SVM
-        predictions, uncertainties = self.bayesian_svm.predict_hybrid(features_scaled)
-        sentiment_label = self.label_decoder[predictions[0]]
-        confidence = 1 - uncertainties[0]
-        uncertainty = uncertainties[0]
-
-        # Extract key phrases (simple implementation)
-        key_phrases = self._extract_key_phrases(processed_content['cleaned_text'])
-
-        # Generate explanation if requested
-        explanation = None
-        if explain and EXPLAINABLE_AI_AVAILABLE:
-            def predict_fn(texts):
-                processed = [self.multilingual_parser.process_content(t) for t in texts]
-                features = np.array([self._extract_features(p) for p in processed])
-                features_scaled = self.scaler.transform(features)
-                probs = self.bayesian_svm.svm_model.predict_proba(features_scaled)
-                return probs
-
-            explanation = self.explainer.explain_prediction_lime(
-                processed_content['cleaned_text'],
-                predict_fn
-            )
-
-        # Create result
-        result = SentimentResult(
-            text=text,
-            sentiment=sentiment_label,
-            confidence=confidence,
-            uncertainty=uncertainty,
-            explanation=explanation,
-            key_phrases=key_phrases,
-            processing_time=time.time() - start_time,
-            language=processed_content['detected_language']
-        )
-
-        # Cache result
-        self.cache_system.put(str(cache_key), result)
-
-        return result
-
-    def analyze_batch(self, texts: List[str], explain: bool = False) -> List[SentimentResult]:
-        """
-        Analyze sentiment for multiple texts efficiently.
-
-        Args:
-            texts: List of social media texts
-            explain: Whether to generate explanations
-
-        Returns:
-            List of SentimentResult objects
-        """
-        logger.info(f"Analyzing batch of {len(texts)} texts...")
-
-        results = []
-        for text in texts:
+        
+        # Ensure vectors are normalized for cosine similarity
+        vectors = self._normalize_vectors(vectors)
+        
+        if self.primary_index is not None and hasattr(self.primary_index, 'add_items'):
             try:
-                result = self.analyze_sentiment(text, explain=explain)
-                results.append(result)
+                # Convert to float32 for HNSW
+                vectors_float32 = vectors.astype(np.float32)
+                self.primary_index.add_items(vectors_float32, np.arange(len(ids)))
             except Exception as e:
-                logger.error(f"Error analyzing text: {e}")
-                # Create error result
-                error_result = SentimentResult(
-                    text=text,
-                    sentiment='neutral',
-                    confidence=0.0,
-                    uncertainty=1.0,
-                    explanation={'explanation': f'Error: {str(e)}'},
-                    key_phrases=[],
-                    processing_time=0.0,
-                    language='unknown'
-                )
-                results.append(error_result)
-
+                print(f"HNSW add failed: {e}. Rebuilding index...")
+                self._rebuild_primary_index(vectors, ids)
+                
+        if self.secondary_index is not None:
+            try:
+                vectors_float32 = vectors.astype(np.float32)
+                self.secondary_index.add(vectors_float32)
+            except Exception as e:
+                print(f"FAISS add failed: {e}")
+                
+        if self.fallback_index is not None:
+            if self.fallback_data is None:
+                self.fallback_data = vectors
+                self.fallback_ids = ids
+            else:
+                self.fallback_data = np.vstack([self.fallback_data, vectors])
+                self.fallback_ids.extend(ids)
+            self.fallback_index = BallTree(self.fallback_data, metric='cosine')
+            
+        # Update capacity tracking
+        self.current_capacity += len(vectors)
+        
+        # Clear query cache since index changed
+        self.query_cache.clear()
+        
+        self.index_update_times.append(time.time() - start_time)
+        
+    def query(self, 
+              query_vector: np.ndarray, 
+              k: int = 10,
+              precision: Optional[str] = None,
+              timeout_ms: int = 100) -> Tuple[List[str], List[float]]:
+        """
+        Query for nearest neighbors with configurable precision/timeout.
+        
+        Args:
+            query_vector: Query vector of shape (dimension,)
+            k: Number of neighbors to return
+            precision: Override default precision level
+            timeout_ms: Maximum query time in milliseconds
+            
+        Returns:
+            Tuple of (neighbor_ids, distances)
+        """
+        cache_key = (tuple(query_vector), k, precision)
+        if cache_key in self.query_cache:
+            self.cache_hits += 1
+            return self.query_cache[cache_key]
+            
+        self.cache_misses += 1
+        start_time = time.time()
+        
+        query_vector = self._normalize_vectors(query_vector.reshape(1, -1))[0]
+        actual_precision = precision or self.precision_level
+        
+        results = None
+        
+        # Adaptive query routing based on precision requirements
+        if actual_precision == 'high' or self.ann_method != 'composite':
+            results = self._query_high_precision(query_vector, k, timeout_ms)
+        elif actual_precision == 'medium':
+            results = self._query_medium_precision(query_vector, k, timeout_ms)
+        else:  # adaptive
+            results = self._query_adaptive(query_vector, k, timeout_ms)
+            
+        query_time = time.time() - start_time
+        self.query_times.append(query_time)
+        
+        # Cache results for similar future queries
+        if query_time < timeout_ms / 1000.0:  # Only cache if within timeout
+            self.query_cache[cache_key] = results
+            # Limit cache size
+            if len(self.query_cache) > 10000:
+                self._prune_cache()
+                
         return results
-
-    def _extract_key_phrases(self, text: str, max_phrases: int = 5) -> List[str]:
-        """Extract key phrases from text (simple implementation)."""
-        # Simple keyword extraction based on TF-IDF scores
-        if not hasattr(self.tfidf_vectorizer, 'vocabulary_'):
-            return []
-
-        try:
-            tfidf_scores = self.tfidf_vectorizer.transform([text]).toarray()[0]
-            feature_names = self.tfidf_vectorizer.get_feature_names_out()
-
-            # Get top scoring features
-            top_indices = np.argsort(tfidf_scores)[-max_phrases:][::-1]
-            key_phrases = [feature_names[i] for i in top_indices if tfidf_scores[i] > 0]
-
-            return key_phrases
-        except Exception as e:
-            logger.error(f"Error extracting key phrases: {e}")
-            return []
-
-    def get_model_statistics(self) -> Dict:
-        """Get model performance and usage statistics."""
-        if not self.is_trained:
-            return {'status': 'not_trained'}
-
-        cache_stats = {
-            'cache_size': len(self.cache_system.cache),
-            'cache_hit_rate': len(self.cache_system.access_counts) / max(len(self.cache_system.cache), 1),
-            'total_accesses': sum(self.cache_system.access_counts.values())
-        }
-
+    
+    def _query_high_precision(self, query_vector: np.ndarray, k: int, timeout_ms: int):
+        """High precision query using multiple verification steps."""
+        # Use primary HNSW index
+        if self.primary_index is not None:
+            try:
+                query_vector_float32 = query_vector.astype(np.float32).reshape(1, -1)
+                indices, distances = self.primary_index.knn_query(query_vector_float32, k=k)
+                # HNSW returns squared distances, convert to cosine distances
+                cosine_distances = 1 - (1 - distances[0]) / 2  # Convert to [0, 1] range
+                return [str(i) for i in indices[0]], cosine_distances.tolist()
+            except Exception as e:
+                print(f"HNSW query failed: {e}")
+                
+        return self._query_fallback(query_vector, k)
+    
+    def _query_medium_precision(self, query_vector: np.ndarray, k: int, timeout_ms: int):
+        """Medium precision query balancing speed and accuracy."""
+        # Try FAISS IVF first for speed
+        if self.secondary_index is not None:
+            try:
+                query_vector_float32 = query_vector.astype(np.float32).reshape(1, -1)
+                distances, indices = self.secondary_index.search(query_vector_float32, k)
+                return [str(i) for i in indices[0]], distances[0].tolist()
+            except Exception as e:
+                print(f"FAISS query failed: {e}")
+                
+        return self._query_high_precision(query_vector, k, timeout_ms)
+    
+    def _query_adaptive(self, query_vector: np.ndarray, k: int, timeout_ms: int):
+        """Adaptive query that starts fast and refines if time permits."""
+        start_time = time.time()
+        
+        # First, quick FAISS query
+        if self.secondary_index is not None:
+            try:
+                query_vector_float32 = query_vector.astype(np.float32).reshape(1, -1)
+                distances, indices = self.secondary_index.search(query_vector_float32, k * 2)  # Get extra candidates
+                candidate_ids = [str(i) for i in indices[0]]
+                candidate_distances = distances[0].tolist()
+                
+                # If we have time, refine with HNSW
+                elapsed = (time.time() - start_time) * 1000
+                if elapsed < timeout_ms / 2 and self.primary_index is not None:
+                    refined_ids, refined_distances = self._query_high_precision(query_vector, k, timeout_ms - elapsed)
+                    if len(refined_ids) > 0:
+                        return refined_ids, refined_distances
+                        
+                return candidate_ids[:k], candidate_distances[:k]
+            except Exception as e:
+                print(f"Adaptive query failed: {e}")
+                
+        return self._query_high_precision(query_vector, k, timeout_ms)
+    
+    def _query_fallback(self, query_vector: np.ndarray, k: int):
+        """Fallback query using BallTree."""
+        if self.fallback_index is not None and self.fallback_data is not None:
+            distances, indices = self.fallback_index.query([query_vector], k=k)
+            neighbor_ids = [self.fallback_ids[i] for i in indices[0]]
+            return neighbor_ids, distances[0].tolist()
+        return [], []
+    
+    def _normalize_vectors(self, vectors: np.ndarray) -> np.ndarray:
+        """Normalize vectors for cosine similarity."""
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # Avoid division by zero
+        return vectors / norms
+    
+    def _rebuild_primary_index(self, vectors: np.ndarray, ids: List[str]):
+        """Rebuild primary index when it becomes corrupted or inefficient."""
+        print("Rebuilding primary index...")
+        import hnswlib
+        
+        self.primary_index = hnswlib.Index(space='cosine', dim=self.dimension)
+        self.primary_index.init_index(max_elements=max(self.current_capacity, len(vectors) * 2), 
+                                    ef_construction=200, M=16)
+        
+        if len(vectors) > 0:
+            vectors_float32 = vectors.astype(np.float32)
+            self.primary_index.add_items(vectors_float32, np.arange(len(ids)))
+        
+        self.primary_index.set_ef(50)
+    
+    def _prune_cache(self):
+        """Prune query cache using LRU strategy."""
+        # Simple strategy: remove oldest 20%
+        keys = list(self.query_cache.keys())
+        remove_count = len(keys) // 5
+        for key in keys[:remove_count]:
+            del self.query_cache[key]
+    
+    def get_performance_stats(self) -> Dict:
+        """Get performance statistics for monitoring."""
+        query_times = np.array(self.query_times[-1000:] if self.query_times else [0])
+        update_times = np.array(self.index_update_times[-100:] if self.index_update_times else [0])
+        
         return {
-            'status': 'trained',
-            'model_type': 'Bayesian-SVM Hybrid',
-            'features_count': self.tfidf_vectorizer.max_features,
-            'cache_statistics': cache_stats,
-            'supported_languages': list(self.multilingual_parser.language_patterns.keys()),
-            'explainable_ai_available': EXPLAINABLE_AI_AVAILABLE,
-            'deep_learning_available': TENSORFLOW_AVAILABLE
+            'cache_hit_rate': self.cache_hits / max(1, self.cache_hits + self.cache_misses),
+            'avg_query_time_ms': np.mean(query_times) * 1000,
+            'p95_query_time_ms': np.percentile(query_times, 95) * 1000,
+            'avg_update_time_ms': np.mean(update_times) * 1000,
+            'current_capacity': self.current_capacity,
+            'cache_size': len(self.query_cache),
+            'index_method': self.ann_method
         }
 
-# Example usage and testing functions
-def create_sample_data() -> Tuple[List[str], List[str]]:
-    """Create sample social media data for testing."""
-    sample_texts = [
-        "I love this new product! 😍 #amazing #bestever",
-        "This is terrible. Worst experience ever 😡",
-        "It's okay, nothing special really",
-        "Absolutely fantastic! Highly recommend 👍 #great",
-        "Not sure about this... could be better",
-        "Hate it! Complete waste of money 💸",
-        "Pretty good overall, satisfied with purchase",
-        "Meh, it's average I guess 🤷‍♀️",
-        "Outstanding quality! Will buy again! ⭐⭐⭐⭐⭐",
-        "Disappointed with the service 😞"
-    ]
+class DistributedSemanticEngine:
+    """
+    Distributed version for massive-scale platforms.
+    Uses sharding and parallel processing.
+    """
+    
+    def __init__(self, 
+                 num_shards: int = 8,
+                 shard_dimension: int = 32,  # Reduced dimension per shard
+                 coordinator_url: Optional[str] = None):
+        
+        self.num_shards = num_shards
+        self.shard_dimension = shard_dimension
+        self.shards = []
+        self.coordinator_url = coordinator_url
+        
+        # Initialize shards
+        for i in range(num_shards):
+            shard = ScalableSemanticIndex(
+                dimension=shard_dimension,
+                ann_method='hnsw',
+                precision_level='adaptive'
+            )
+            self.shards.append(shard)
+            
+        # Query coordinator
+        self.query_executor = ThreadPoolExecutor(max_workers=num_shards)
+        
+    def add_items_distributed(self, vectors: np.ndarray, ids: List[str]):
+        """Add items using dimensional sharding."""
+        if vectors.shape[1] != self.shard_dimension * self.num_shards:
+            raise ValueError(f"Vector dimension {vectors.shape[1]} doesn't match shard configuration")
+            
+        # Split vectors across dimensional shards
+        shard_vectors = []
+        for i in range(self.num_shards):
+            start_idx = i * self.shard_dimension
+            end_idx = (i + 1) * self.shard_dimension
+            shard_vec = vectors[:, start_idx:end_idx]
+            shard_vectors.append(shard_vec)
+            
+        # Add to shards in parallel
+        futures = []
+        for i, shard in enumerate(self.shards):
+            future = self.query_executor.submit(shard.add_items, shard_vectors[i], ids)
+            futures.append(future)
+            
+        # Wait for completion
+        for future in futures:
+            future.result()
+    
+    def query_distributed(self, 
+                         query_vector: np.ndarray, 
+                         k: int = 10,
+                         fusion_method: str = 'weighted') -> Tuple[List[str], List[float]]:
+        """
+        Query across all shards and fuse results.
+        
+        Args:
+            fusion_method: 'weighted', 'borda', 'reciprocal'
+        """
+        # Split query vector
+        shard_queries = []
+        for i in range(self.num_shards):
+            start_idx = i * self.shard_dimension
+            end_idx = (i + 1) * self.shard_dimension
+            shard_query = query_vector[start_idx:end_idx]
+            shard_queries.append(shard_query)
+            
+        # Query all shards in parallel
+        futures = []
+        for i, shard in enumerate(self.shards):
+            future = self.query_executor.submit(shard.query, shard_queries[i], k * 2)  # Get more candidates
+            futures.append((i, future))
+            
+        # Collect results
+        shard_results = []
+        for shard_id, future in futures:
+            try:
+                ids, distances = future.result(timeout=1.0)  # 1 second timeout per shard
+                shard_results.append((shard_id, ids, distances))
+            except Exception as e:
+                print(f"Shard {shard_id} query failed: {e}")
+                shard_results.append((shard_id, [], []))
+                
+        # Fuse results
+        return self._fuse_results(shard_results, k, fusion_method)
+    
+    def _fuse_results(self, 
+                     shard_results: List[Tuple[int, List[str], List[float]]], 
+                     k: int,
+                     fusion_method: str) -> Tuple[List[str], List[float]]:
+        """Fuse results from multiple shards."""
+        if fusion_method == 'weighted':
+            return self._fuse_weighted(shard_results, k)
+        elif fusion_method == 'borda':
+            return self._fuse_borda(shard_results, k)
+        else:  # reciprocal
+            return self._fuse_reciprocal(shard_results, k)
+    
+    def _fuse_weighted(self, shard_results, k):
+        """Weighted fusion based on shard reliability."""
+        candidate_scores = defaultdict(float)
+        
+        for shard_id, ids, distances in shard_results:
+            if not ids:
+                continue
+                
+            # Convert distances to similarities (higher is better)
+            similarities = [1 - d for d in distances]
+            max_sim = max(similarities) if similarities else 1
+            
+            for i, (item_id, sim) in enumerate(zip(ids, similarities)):
+                # Weight by rank position and shard reliability
+                rank_weight = 1.0 / (i + 1)  # Higher rank = more weight
+                shard_weight = 1.0  # Could be based on shard performance history
+                normalized_sim = sim / max_sim
+                
+                score = rank_weight * shard_weight * normalized_sim
+                candidate_scores[item_id] += score
+                
+        # Get top k candidates
+        top_candidates = heapq.nlargest(k, candidate_scores.items(), key=lambda x: x[1])
+        top_ids = [candidate[0] for candidate in top_candidates]
+        top_scores = [candidate[1] for candidate in top_candidates]
+        
+        return top_ids, top_scores
+    
+    def _fuse_borda(self, shard_results, k):
+        """Borda count fusion."""
+        candidate_ranks = defaultdict(list)
+        
+        for shard_id, ids, distances in shard_results:
+            for rank, item_id in enumerate(ids):
+                candidate_ranks[item_id].append(rank)
+                
+        # Average rank for each candidate
+        candidate_avg_ranks = {}
+        for item_id, ranks in candidate_ranks.items():
+            candidate_avg_ranks[item_id] = sum(ranks) / len(ranks)
+            
+        # Get top k by average rank (lower is better)
+        top_candidates = heapq.nsmallest(k, candidate_avg_ranks.items(), key=lambda x: x[1])
+        top_ids = [candidate[0] for candidate in top_candidates]
+        top_scores = [1.0 / (candidate[1] + 1) for candidate in top_candidates]  # Convert back to score
+        
+        return top_ids, top_scores
 
-    sample_labels = [
-        'positive', 'negative', 'neutral', 'positive', 'neutral',
-        'negative', 'positive', 'neutral', 'positive', 'negative'
-    ]
+# Enhanced Word2WorldEngine with scalable indexing
+class ScalableWord2WorldEngine(Word2WorldEngine):
+    """
+    Scalable version of Word2WorldEngine for massive datasets.
+    """
+    
+    def __init__(self, 
+                 semantic_analyzer,
+                 bridge_threshold: float = 0.3,
+                 enable_distributed: bool = False,
+                 shard_config: Optional[Dict] = None):
+        
+        super().__init__(semantic_analyzer, bridge_threshold)
+        
+        self.enable_distributed = enable_distributed
+        self.shard_config = shard_config or {'num_shards': 4, 'shard_dimension': 32}
+        
+        if enable_distributed and len(self.user_coordinates) > 100000:
+            self.semantic_index = DistributedSemanticEngine(**self.shard_config)
+        else:
+            self.semantic_index = ScalableSemanticIndex(
+                dimension=128,  # STAP output dimension
+                ann_method='composite',
+                precision_level='adaptive'
+            )
+            
+        # Batch processing for efficiency
+        self.pending_updates = []
+        self.batch_size = 1000
+        self.last_batch_process = time.time()
+        
+    def update_user_semantic_profile_batch(self, user_updates: List[Tuple[str, np.ndarray]]):
+        """
+        Batch update for better performance with large datasets.
+        """
+        self.pending_updates.extend(user_updates)
+        
+        # Process batch if size threshold or time threshold reached
+        if (len(self.pending_updates) >= self.batch_size or 
+            time.time() - self.last_batch_process > 300):  # 5 minutes
+            
+            self._process_batch_updates()
+            
+    def _process_batch_updates(self):
+        """Process accumulated batch updates."""
+        if not self.pending_updates:
+            return
+            
+        user_ids = [update[0] for update in self.pending_updates]
+        vectors = np.array([update[1] for update in self.pending_updates])
+        
+        # Update semantic index
+        self.semantic_index.add_items(vectors, user_ids)
+        
+        # Update local coordinates (for small-scale operations)
+        for user_id, vector in self.pending_updates:
+            if user_id in self.user_coordinates:
+                # Update existing (simplified - in practice, you'd want more sophisticated merging)
+                old = self.user_coordinates[user_id]
+                self.user_coordinates[user_id] = SemanticCoordinate(
+                    user_id=user_id,
+                    coordinate=vector,
+                    confidence=min(1.0, old.confidence + 0.1),
+                    last_updated=time.time(),
+                    post_count=old.post_count + 1
+                )
+            else:
+                self.user_coordinates[user_id] = SemanticCoordinate(
+                    user_id=user_id,
+                    coordinate=vector,
+                    confidence=0.7,
+                    last_updated=time.time(),
+                    post_count=1
+                )
+                
+        self.pending_updates.clear()
+        self.last_batch_process = time.time()
+        
+    def generate_bridge_recommendations_scalable(self, 
+                                               user_id: str, 
+                                               max_recommendations: int = 3,
+                                               timeout_ms: int = 500) -> List[BridgeRecommendation]:
+        """
+        Scalable version of bridge recommendation generation.
+        """
+        if user_id not in self.user_coordinates:
+            return []
+            
+        user_coord = self.user_coordinates[user_id]
+        
+        # Use scalable semantic index
+        neighbor_ids, distances = self.semantic_index.query(
+            user_coord.coordinate, 
+            k=max_recommendations * 10,  # Get more candidates for filtering
+            timeout_ms=timeout_ms
+        )
+        
+        recommendations = []
+        for neighbor_id, distance in zip(neighbor_ids, distances):
+            if (distance < 0.1 or distance > self.bridge_threshold or 
+                neighbor_id == user_id):
+                continue
+                
+            # Same bridge generation logic as before, but scalable
+            bridge_content = self._find_bridging_content_scalable(user_id, neighbor_id)
+            if bridge_content:
+                bridge_strength = self._calculate_bridge_strength(user_coord.coordinate, 
+                                                                self.user_coordinates[neighbor_id].coordinate)
+                
+                explanation = self._generate_bridge_explanation(user_id, neighbor_id, bridge_content)
+                
+                recommendations.append(BridgeRecommendation(
+                    source_user=user_id,
+                    target_user=neighbor_id,
+                    content_to_share=bridge_content,
+                    semantic_distance=distance,
+                    bridge_strength=bridge_strength,
+                    explanation=explanation
+                ))
+                
+            if len(recommendations) >= max_recommendations:
+                break
+                
+        return sorted(recommendations, key=lambda x: x.bridge_strength, reverse=True)
 
-    return sample_texts, sample_labels
-
-def demo_sentiment_analyzer():
-    """Demonstrate the sentiment analyzer functionality."""
-    print("🚀 Social Media Sentiment Analyzer Demo")
-    print("=" * 50)
-
-    # Create analyzer
-    config = AnalysisConfig(max_features=1000, cache_size=100)
-    analyzer = SocialMediaSentimentAnalyzer(config)
-
-    # Create sample data
-    texts, labels = create_sample_data()
-
-    # Train the model
-    print("📚 Training the model...")
-    analyzer.train(texts, labels)
-
-    # Test on new examples
-    test_texts = [
-        "This movie is absolutely incredible! Best film of the year! 🎬✨",
-        "Terrible service, very disappointed 😠",
-        "It's an okay product, nothing extraordinary",
-        "¡Me encanta este producto! Es fantástico! 🇪🇸",  # Spanish
-        "C'est un produit formidable! Je le recommande! 🇫🇷"  # French
-    ]
-
-    print("\n🔍 Analyzing test examples...")
-    print("-" * 50)
-
-    for text in test_texts:
-        result = analyzer.analyze_sentiment(text, explain=True)
-
-        print(f"\nText: {result.text}")
-        print(f"Sentiment: {result.sentiment.upper()}")
-        print(f"Confidence: {result.confidence:.3f}")
-        print(f"Uncertainty: {result.uncertainty:.3f}")
-        print(f"Language: {result.language}")
-        print(f"Processing Time: {result.processing_time:.3f}s")
-
-        if result.key_phrases:
-            print(f"Key Phrases: {', '.join(result.key_phrases)}")
-
-        if result.explanation and 'explanation' in result.explanation:
-            print(f"Explanation: {result.explanation['explanation']}")
-
-        print("-" * 30)
-
-    # Show model statistics
-    print("\n📊 Model Statistics:")
-    stats = analyzer.get_model_statistics()
-    for key, value in stats.items():
-        print(f"{key}: {value}")
-
-if __name__ == "__main__":
-    demo_sentiment_analyzer()
+# Performance monitoring and optimization
+class PerformanceOptimizer:
+    """
+    Continuously optimizes system performance based on usage patterns.
+    """
+    
+    def __init__(self, semantic_engine: ScalableWord2WorldEngine):
+        self.engine = semantic_engine
+        self.performance_history = []
+        self.optimization_thread = threading.Thread(target=self._optimization_loop, daemon=True)
+        self.optimization_thread.start()
+        
+    def _optimization_loop(self):
+        """Continuous optimization loop."""
+        while True:
+            time.sleep(300)  # Run every 5 minutes
+            
+            try:
+                self._analyze_and_optimize()
+            except Exception as e:
+                print(f"Optimization error: {e}")
+                
+    def _analyze_and_optimize(self):
+        """Analyze performance and apply optimizations."""
+        stats = self.engine.semantic_index.get_performance_stats()
+        self.performance_history.append(stats)
+        
+        # Adaptive optimization strategies
+        if stats['p95_query_time_ms'] > 100:  # Slow queries
+            self._optimize_for_speed()
+            
+        if stats['cache_hit_rate'] < 0.3:  # Poor cache performance
+            self._optimize_caching()
+            
+        if len(self.engine.user_coordinates) > 500000:  # Large dataset
+            self._enable_distributed_if_needed()
+    
+    def _optimize_for_speed(self):
+        """Optimize for query speed."""
+        index = self.engine.semantic_index
+        if hasattr(index, 'primary_index') and index.primary_index is not None:
+            # Reduce HNSW accuracy for speed
+            index.primary_index.set_ef(30)  # Lower ef = faster, less accurate
+            
+    def _optimize_caching(self):
+        """Optimize caching strategy."""
+        # Implement more sophisticated caching
+        pass
+        
+    def _enable_distributed_if_needed(self):
+        """Enable distributed processing if scale requires it."""
+        if (not self.engine.enable_distributed and 
+            len(self.engine.user_coordinates) > 1000000):
+            
+            print("Enabling distributed processing for scale...")
+            # In practice, you'd migrate to distributed setup
+            pass
