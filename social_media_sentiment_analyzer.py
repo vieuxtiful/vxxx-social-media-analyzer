@@ -11,7 +11,7 @@ Key Features:
 - Multilingual processing for global social media analysis
 - Intelligent caching for real-time streaming data analysis
 
-Author: Vieux V.
+Author: vieuxtiful
 License: MIT
 """
 
